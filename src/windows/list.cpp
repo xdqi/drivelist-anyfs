@@ -29,13 +29,52 @@
 #include <inttypes.h>
 #include <napi.h>
 #include <wchar.h>
+#include <stdio.h>
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
+#include <cctype>
 #include "../drivelist.hpp"
 #include "list.hpp"
 
 namespace Drivelist {
+
+// anyfs fork: GPT partition Name is WCHAR[36] without a guaranteed
+// null terminator, so wcslen-based conversion overruns. Convert a
+// fixed-length WCHAR buffer, trimming at the first embedded null.
+std::string WCharFixedToUtf8(const wchar_t* wstr, size_t maxLen) {
+  if (!wstr) return std::string();
+  size_t len = 0;
+  while (len < maxLen && wstr[len] != 0) len++;
+  if (len == 0) return std::string();
+  int size = WideCharToMultiByte(CP_UTF8, 0, wstr, static_cast<int>(len),
+                                 NULL, 0, NULL, NULL);
+  if (!size) return std::string();
+  std::string result(size, 0);
+  int got = WideCharToMultiByte(CP_UTF8, 0, wstr, static_cast<int>(len),
+                                &result[0], size, NULL, NULL);
+  if (got != size) return std::string();
+  return result;
+}
+
+// anyfs fork: stringify a Win32 GUID in canonical lowercase form.
+std::string FormatGuid(const GUID& g) {
+  char buf[40];
+  snprintf(buf, sizeof(buf),
+    "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+    static_cast<unsigned long>(g.Data1),
+    static_cast<unsigned int>(g.Data2),
+    static_cast<unsigned int>(g.Data3),
+    g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+    g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+  return std::string(buf);
+}
+
+bool IsZeroGuid(const GUID& g) {
+  static const GUID zero = {0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}};
+  return memcmp(&g, &zero, sizeof(GUID)) == 0;
+}
 
 std::string WCharToUtf8String(const wchar_t* wstr) {
   if (!wstr) {
@@ -377,7 +416,109 @@ bool GetDeviceBlockSize(HANDLE hPhysical, DeviceDescriptor *device) {
   return false;
 }
 
-bool GetPartitionTableType(HANDLE hPhysical, DeviceDescriptor *device) {
+// anyfs fork: pull fstype / label / serial / mountpoints / volume guid
+// path for each partition by walking FindFirstVolumeW and matching
+// (DiskNumber, StartingOffset) against the partitions we already
+// extracted from the partition table.
+void EnrichPartitionsWithVolumes(
+    int32_t deviceNumber,
+    const std::map<int64_t, size_t>& offsetToIdx,
+    DeviceDescriptor *device) {
+  WCHAR volumeName[MAX_PATH];
+  HANDLE hSearch = FindFirstVolumeW(volumeName, MAX_PATH);
+  if (hSearch == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  do {
+    size_t nameLen = wcslen(volumeName);
+    if (nameLen == 0) continue;
+
+    // FindFirstVolume returns "\\?\Volume{GUID}\" with a trailing
+    // backslash. CreateFile() needs the path without the trailing
+    // backslash; GetVolumeInformationW() needs it WITH the slash.
+    WCHAR opened[MAX_PATH];
+    for (size_t i = 0; i < nameLen + 1 && i < MAX_PATH; i++) {
+      opened[i] = volumeName[i];
+    }
+    if (nameLen >= 1 && opened[nameLen - 1] == L'\\') {
+      opened[nameLen - 1] = 0;
+    }
+
+    HANDLE hVol = CreateFileW(opened, 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hVol == INVALID_HANDLE_VALUE) {
+      continue;
+    }
+
+    VOLUME_DISK_EXTENTS extents;
+    DWORD bytesReturned = 0;
+    BOOL ok = DeviceIoControl(
+        hVol, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+        NULL, 0, &extents, sizeof(extents), &bytesReturned, NULL);
+    CloseHandle(hVol);
+    if (!ok || extents.NumberOfDiskExtents == 0) continue;
+    // Spanned/RAID volumes have multiple extents — skip (a volume that
+    // straddles partitions isn't a partition).
+    if (extents.NumberOfDiskExtents > 1) continue;
+
+    const DISK_EXTENT &ext = extents.Extents[0];
+    if (static_cast<int32_t>(ext.DiskNumber) != deviceNumber) continue;
+    auto it = offsetToIdx.find(ext.StartingOffset.QuadPart);
+    if (it == offsetToIdx.end()) continue;
+
+    Partition &p = device->partitions[it->second];
+
+    // OS-recognized partition → canonical device path is the volume
+    // GUID name. anyfs can CreateFileW() it directly for FS reads.
+    p.device = WCharToUtf8String(volumeName);
+
+    WCHAR fsNameW[32];
+    WCHAR labelW[MAX_PATH];
+    DWORD serial = 0, maxComp = 0, fsFlags = 0;
+    if (GetVolumeInformationW(volumeName, labelW, MAX_PATH,
+                              &serial, &maxComp, &fsFlags,
+                              fsNameW, 32)) {
+      p.fstype = WCharToUtf8String(fsNameW);
+      // lowercase to match Linux fstype values ("NTFS" → "ntfs").
+      for (auto &c : p.fstype) c = static_cast<char>(tolower(c));
+      p.label = WCharToUtf8String(labelW);
+      // Windows volumes don't expose a true FS UUID — only a 32-bit
+      // serial. Render it as the conventional "XXXX-XXXX" form used
+      // by `vol` / FAT-style displays so it's at least recognizable.
+      char serialBuf[16];
+      snprintf(serialBuf, sizeof(serialBuf), "%04X-%04X",
+               static_cast<unsigned int>((serial >> 16) & 0xFFFF),
+               static_cast<unsigned int>(serial & 0xFFFF));
+      p.uuid = serialBuf;
+      if (fsFlags & FILE_READ_ONLY_VOLUME) {
+        p.isReadOnly = true;
+      }
+    }
+
+    // Drive-letter and folder mount points — double-null-terminated.
+    DWORD pathBufLen = 0;
+    GetVolumePathNamesForVolumeNameW(volumeName, NULL, 0, &pathBufLen);
+    if (pathBufLen > 0) {
+      WCHAR *pathBuf = new WCHAR[pathBufLen];
+      if (GetVolumePathNamesForVolumeNameW(volumeName, pathBuf, pathBufLen,
+                                           &pathBufLen)) {
+        for (WCHAR *cur = pathBuf; *cur; cur += wcslen(cur) + 1) {
+          std::string path = WCharToUtf8String(cur);
+          if (!path.empty()) {
+            p.mountpoints.push_back(path);
+            p.mountpointLabels.push_back(p.label);
+          }
+        }
+      }
+      delete[] pathBuf;
+    }
+  } while (FindNextVolumeW(hSearch, volumeName, MAX_PATH));
+  FindVolumeClose(hSearch);
+}
+
+bool GetPartitionTableType(HANDLE hPhysical, int32_t deviceNumber,
+                           DeviceDescriptor *device) {
   // Works for up to 256 partitions (Windows only allows 128 for GPT partition
   // tables anyway)
   int lsize = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + \
@@ -395,7 +536,9 @@ bool GetPartitionTableType(HANDLE hPhysical, DeviceDescriptor *device) {
     &diskLayoutSize,
     NULL);
   if (!hasDiskLayout) {
-    free(diskLayout);
+    // anyfs fork: matched allocator — `new BYTE[]` pairs with
+    // `delete[]`, not free(). Pre-existing typo, fixed in passing.
+    delete[] reinterpret_cast<BYTE*>(diskLayout);
     return hasDiskLayout;
   }
   /*
@@ -434,13 +577,61 @@ bool GetPartitionTableType(HANDLE hPhysical, DeviceDescriptor *device) {
   | pe0.Mbr.HiddenSectors        |                  na |                2048 |                   0 |                   0 |                   0 |                   0 |                   0 |
   +------------------------------+---------------------+---------------------+---------------------+---------------------+---------------------+---------------------+---------------------+
   */
+  bool partitioned = false;
   if ((diskLayout->PartitionStyle == PARTITION_STYLE_MBR) &&
       ((diskLayout->PartitionCount % 4) == 0)) {
     device->partitionTableType = "mbr";
+    partitioned = true;
   } else if (diskLayout->PartitionStyle == PARTITION_STYLE_GPT) {
     device->partitionTableType = "gpt";
+    partitioned = true;
   }
-  free(diskLayout);
+
+  // anyfs fork: emit per-partition info from the same layout buffer
+  // we already paid the IOCTL for. Skip extended-container MBR types
+  // (0x05, 0x0F) since their PartitionLength covers all logical
+  // partitions and they aren't independently mountable.
+  std::map<int64_t, size_t> offsetToIdx;
+  if (partitioned) {
+    for (DWORD i = 0; i < diskLayout->PartitionCount; i++) {
+      const PARTITION_INFORMATION_EX &pe = diskLayout->PartitionEntry[i];
+      if (pe.PartitionLength.QuadPart <= 0) continue;
+
+      Partition p;
+      if (diskLayout->PartitionStyle == PARTITION_STYLE_GPT) {
+        if (IsZeroGuid(pe.Gpt.PartitionType)) continue;
+        p.parttype = FormatGuid(pe.Gpt.PartitionType);
+        p.partlabel = WCharFixedToUtf8(pe.Gpt.Name, 36);
+      } else {
+        // PARTITION_STYLE_MBR
+        BYTE t = pe.Mbr.PartitionType;
+        if (t == 0 || t == 0x05 || t == 0x0F) continue;
+        char typeBuf[8];
+        snprintf(typeBuf, sizeof(typeBuf), "0x%02x", t);
+        p.parttype = typeBuf;
+      }
+      p.size = static_cast<uint64_t>(pe.PartitionLength.QuadPart);
+      p.number = static_cast<int32_t>(pe.PartitionNumber);
+
+      // Synthetic device path. Real Win32 partitions don't have a
+      // canonical user-mode path — `\\.\PhysicalDriveN` + offset is
+      // the lowest common denominator. EnrichPartitionsWithVolumes
+      // overwrites this with the volume GUID when one is mounted.
+      char devBuf[80];
+      snprintf(devBuf, sizeof(devBuf),
+               "\\\\.\\PhysicalDrive%d\\Partition%u",
+               deviceNumber,
+               static_cast<unsigned int>(pe.PartitionNumber));
+      p.device = devBuf;
+
+      offsetToIdx[pe.StartingOffset.QuadPart] = device->partitions.size();
+      device->partitions.push_back(p);
+    }
+    device->partitionsNull = false;
+    EnrichPartitionsWithVolumes(deviceNumber, offsetToIdx, device);
+  }
+
+  delete[] reinterpret_cast<BYTE*>(diskLayout);
   return hasDiskLayout;
 }
 
@@ -621,7 +812,7 @@ bool GetDetailData(DeviceDescriptor* device,
       break;
     }
 
-    if (!GetPartitionTableType(hPhysical, device)) {
+    if (!GetPartitionTableType(hPhysical, deviceNumber, device)) {
       errorCode = GetLastError();
       device->error = "Couldn't get disk partition table type: Error " +
         std::to_string(errorCode);

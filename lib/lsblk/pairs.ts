@@ -182,6 +182,10 @@ export function parse(stdout: string): Drive[] {
 				partitionTableType: getPartitionTableType(
 					device.pttype as 'gpt' | 'dos' | undefined,
 				),
+				// anyfs fork: pairs fallback (lsblk without --json) doesn't
+				// carry per-partition fields, so signal "unknown" rather than
+				// claim an empty partition list.
+				partitions: null,
 			};
 		},
 	);

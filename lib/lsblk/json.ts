@@ -17,7 +17,7 @@
 import { posix } from 'path';
 
 import { getPartitionTableType } from '.';
-import { Drive, Mountpoint } from '..';
+import { Drive, Mountpoint, Partition } from '..';
 
 interface LsblkJsonOutput {
 	blockdevices: LsblkJsonOutputDevice[];
@@ -43,10 +43,22 @@ interface LsblkJsonOutputDevice {
 	pttype?: 'gpt' | 'dos';
 }
 
+// anyfs fork: per-partition fields lsblk --output-all already emits. We
+// declare them so getPartitions() can extract a typed Partition[].
 interface LsblkJsonOutputDeviceChild {
+	name?: string;
+	kname?: string;
 	label: string | null;
 	mountpoint?: string;
+	mountpoints?: (string | null)[];
 	partlabel: string | null;
+	fstype?: string | null;
+	uuid?: string | null;
+	partuuid?: string | null;
+	parttype?: string | null;
+	partn?: string | number | null;
+	size?: string;
+	ro?: string;
 }
 
 function getMountpoints(
@@ -62,6 +74,53 @@ function getMountpoints(
 				label: child.label || child.partlabel,
 			};
 		});
+}
+
+// anyfs fork: collect every mountpoint a single child reports.
+// Newer lsblk emits `mountpoints: [...]` (array) instead of/in addition
+// to legacy `mountpoint: string`, so we union them.
+function getChildMountpoints(child: LsblkJsonOutputDeviceChild): Mountpoint[] {
+	const paths = new Set<string>();
+	if (child.mountpoint) {
+		paths.add(child.mountpoint);
+	}
+	if (child.mountpoints) {
+		for (const p of child.mountpoints) {
+			if (p) {
+				paths.add(p);
+			}
+		}
+	}
+	const label = child.label || child.partlabel || null;
+	return [...paths].map((path) => ({ path, label }));
+}
+
+function getPartitions(
+	children: LsblkJsonOutputDeviceChild[] | undefined,
+): Partition[] {
+	if (!children) {
+		return [];
+	}
+	return children.map((c): Partition => {
+		const partn =
+			c.partn == null
+				? null
+				: typeof c.partn === 'number'
+				? c.partn
+				: Number(c.partn) || null;
+		return {
+			device: resolveDeviceName(c.name) || resolveDeviceName(c.kname) || '',
+			size: Number(c.size) || null,
+			number: partn,
+			fstype: c.fstype || null,
+			label: c.label || null,
+			uuid: c.uuid || null,
+			partlabel: c.partlabel || null,
+			parttype: c.parttype || null,
+			mountpoints: getChildMountpoints(c),
+			isReadOnly: Number(c.ro) === 1,
+		};
+	});
 }
 
 function getDescription(device: LsblkJsonOutputDevice): string {
@@ -145,6 +204,7 @@ export function transform(data: LsblkJsonOutput): Drive[] {
 					isUSB,
 					isUAS: null,
 					partitionTableType: getPartitionTableType(device.pttype),
+					partitions: getPartitions(device.children),
 				};
 			},
 		);

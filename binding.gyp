@@ -67,7 +67,12 @@
         [ 'OS=="linux"', {
           "sources": [
             "src/linux/list.cpp"
-          ]
+          ],
+          # Export only the N-API entry points (scripts/build-linux-electron.sh
+          # links libc++ statically; keep its symbols out of Electron's way).
+          "cflags": [ "-fvisibility=hidden" ],
+          "cflags_cc": [ "-fvisibility-inlines-hidden" ],
+          "ldflags": [ "-Wl,--version-script=<(module_root_dir)/exports.map" ]
         }]
       ]
     }

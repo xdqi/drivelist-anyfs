@@ -28,6 +28,23 @@ export interface Mountpoint {
 	label: string | null;
 }
 
+// anyfs fork addition: per-partition info as reported by the host OS
+// (without elevated privileges). FS-aware fields (fstype/label/uuid) are populated only when
+// the OS already identified the partition; unknown partitions show as
+// nulls — that's the user's signal to grant raw read.
+export interface Partition {
+	device: string;
+	size: number | null;
+	number: number | null;
+	fstype: string | null;
+	label: string | null;
+	uuid: string | null;
+	partlabel: string | null;
+	parttype: string | null;
+	mountpoints: Mountpoint[];
+	isReadOnly: boolean;
+}
+
 export interface Drive {
 	blockSize: number;
 	busType: string;
@@ -50,6 +67,9 @@ export interface Drive {
 	raw: string;
 	size: number | null;
 	partitionTableType: 'mbr' | 'gpt' | null;
+	// anyfs fork addition. null when the platform cannot provide
+	// partition metadata (including the legacy lsblk pairs fallback).
+	partitions: Partition[] | null;
 }
 
 const drivelistBindings = bindings('drivelist');
@@ -60,6 +80,13 @@ function bindingsList(): Promise<Drive[]> {
 			if (error != null) {
 				reject(error);
 			} else {
+				// Keep the API defined when loading an older native binding
+				// that does not provide partition metadata.
+				for (const d of drives) {
+					if (d.partitions === undefined) {
+						d.partitions = null;
+					}
+				}
 				resolve(drives);
 			}
 		});

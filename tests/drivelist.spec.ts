@@ -84,6 +84,58 @@ describe('Drivelist', () => {
 					device.isUAS === null || typeof device.isUAS === 'boolean',
 					`Invalid isUAS flag: ${device.isUAS}`,
 				);
+				// anyfs fork: partitions[] is null on platforms whose
+				// native binding doesn't emit it yet, or an array on
+				// Linux/lsblk --json. Each entry must carry the same
+				// shape regardless of whether the OS recognized the FS.
+				ok(
+					device.partitions === null || Array.isArray(device.partitions),
+					`Invalid partitions: ${device.partitions}`,
+				);
+				if (Array.isArray(device.partitions)) {
+					device.partitions.forEach((p, i) => {
+						ok(
+							typeof p.device === 'string',
+							`partitions[${i}].device: ${p.device}`,
+						);
+						ok(
+							p.size === null || Number.isFinite(p.size),
+							`partitions[${i}].size: ${p.size}`,
+						);
+						ok(
+							p.number === null || Number.isFinite(p.number),
+							`partitions[${i}].number: ${p.number}`,
+						);
+						ok(
+							p.fstype === null || typeof p.fstype === 'string',
+							`partitions[${i}].fstype: ${p.fstype}`,
+						);
+						ok(
+							p.label === null || typeof p.label === 'string',
+							`partitions[${i}].label: ${p.label}`,
+						);
+						ok(
+							p.uuid === null || typeof p.uuid === 'string',
+							`partitions[${i}].uuid: ${p.uuid}`,
+						);
+						ok(
+							p.partlabel === null || typeof p.partlabel === 'string',
+							`partitions[${i}].partlabel: ${p.partlabel}`,
+						);
+						ok(
+							p.parttype === null || typeof p.parttype === 'string',
+							`partitions[${i}].parttype: ${p.parttype}`,
+						);
+						ok(
+							Array.isArray(p.mountpoints),
+							`partitions[${i}].mountpoints: ${p.mountpoints}`,
+						);
+						ok(
+							typeof p.isReadOnly === 'boolean',
+							`partitions[${i}].isReadOnly: ${p.isReadOnly}`,
+						);
+					});
+				}
 			});
 		});
 

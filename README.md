@@ -5,6 +5,13 @@ drivelist
 
 > List all connected drives in your computer, in all major operating systems.
 
+> **anyfs fork:** [xdqi/drivelist-anyfs](https://github.com/xdqi/drivelist-anyfs)
+> extends [balena's drivelist](https://github.com/balena-io-modules/drivelist)
+> with per-partition metadata and Electron cross-build helpers.
+> See [the fork notes](FORK.md) for differences, build instructions and validation status.
+> The npm badges and installation examples below refer to the upstream package;
+> this fork has not been published to npm.
+
 [![Current Release](https://img.shields.io/npm/v/drivelist.svg?style=flat-square)](https://npmjs.com/package/drivelist)
 [![License](https://img.shields.io/npm/l/drivelist.svg?style=flat-square)](https://npmjs.com/package/drivelist)
 [![Downloads](https://img.shields.io/npm/dm/drivelist.svg?style=flat-square)](https://npmjs.com/package/drivelist)

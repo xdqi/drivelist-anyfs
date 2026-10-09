@@ -119,6 +119,71 @@ Napi::Object PackDriveDescriptor(Napi::Env env,
 
   object.Set(String::New(env, "isUAS"), isUAS);
 
+  // anyfs fork: emit partitions[] when the platform code populated
+  // them, otherwise null. Each entry's empty-string fields are mapped
+  // to null in JS so the shape matches the lsblk path 1:1.
+  if (instance->partitionsNull) {
+    object.Set(String::New(env, "partitions"), env.Null());
+  } else {
+    Napi::Object partitionsArr = Napi::Array::New(env);
+    uint32_t pIndex = 0;
+    for (const Partition &p : instance->partitions) {
+      Napi::Object partObj = Napi::Object::New(env);
+      partObj.Set(String::New(env, "device"), String::New(env, p.device));
+
+      if (p.size == 0) {
+        partObj.Set(String::New(env, "size"), env.Null());
+      } else {
+        partObj.Set(String::New(env, "size"),
+                    Number::New(env, static_cast<double>(p.size)));
+      }
+
+      if (p.number < 0) {
+        partObj.Set(String::New(env, "number"), env.Null());
+      } else {
+        partObj.Set(String::New(env, "number"),
+                    Number::New(env, static_cast<double>(p.number)));
+      }
+
+      auto setStringOrNull = [&](const char *key, const std::string &val) {
+        if (val.empty()) {
+          partObj.Set(String::New(env, key), env.Null());
+        } else {
+          partObj.Set(String::New(env, key), String::New(env, val));
+        }
+      };
+      setStringOrNull("fstype", p.fstype);
+      setStringOrNull("label", p.label);
+      setStringOrNull("uuid", p.uuid);
+      setStringOrNull("partlabel", p.partlabel);
+      setStringOrNull("parttype", p.parttype);
+
+      Napi::Object mps = Napi::Array::New(env);
+      uint32_t mpIdx = 0;
+      for (const std::string &path : p.mountpoints) {
+        Napi::Object mp = Napi::Object::New(env);
+        mp.Set(String::New(env, "path"), String::New(env, path));
+        if (mpIdx < p.mountpointLabels.size() &&
+            !p.mountpointLabels[mpIdx].empty()) {
+          mp.Set(String::New(env, "label"),
+                 String::New(env, p.mountpointLabels[mpIdx]));
+        } else {
+          mp.Set(String::New(env, "label"), env.Null());
+        }
+        mps.Set(mpIdx, mp);
+        mpIdx++;
+      }
+      partObj.Set(String::New(env, "mountpoints"), mps);
+
+      partObj.Set(String::New(env, "isReadOnly"),
+                  Boolean::New(env, p.isReadOnly));
+
+      partitionsArr.Set(pIndex, partObj);
+      pIndex++;
+    }
+    object.Set(String::New(env, "partitions"), partitionsArr);
+  }
+
   return object;
 }
 

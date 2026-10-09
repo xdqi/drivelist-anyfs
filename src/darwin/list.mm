@@ -16,6 +16,7 @@
  */
 
 #include <napi.h>
+#include <map>
 #include "../drivelist.hpp"
 
 #import "REDiskList.h"
@@ -105,6 +106,73 @@ namespace Drivelist {
     return device;
   }
 
+  // anyfs fork: convert a DA description for a disk{N}s{M} entry into
+  // a Partition struct on the parent disk{N}. Mountpoints are filled
+  // in by the subsequent mountedVolumeURLs scan, so the FS-aware
+  // fields here come straight from DA's volume probe.
+  Partition CreatePartitionFromDiskDescription(std::string bsdName,
+                                               CFDictionaryRef dd) {
+    Partition p;
+    p.device = "/dev/" + bsdName;
+
+    size_t sIdx = bsdName.rfind('s');
+    if (sIdx != std::string::npos && sIdx + 1 < bsdName.size()) {
+      try {
+        p.number = std::stoi(bsdName.substr(sIdx + 1));
+      } catch (...) {
+        // leave as -1
+      }
+    }
+
+    NSNumber *sz = DictionaryGetNumber(dd, kDADiskDescriptionMediaSizeKey);
+    if (sz != nil) {
+      p.size = [sz unsignedLongLongValue];
+    }
+
+    NSString *vKind = (NSString *)CFDictionaryGetValue(
+        dd, kDADiskDescriptionVolumeKindKey);
+    if (vKind != nil) {
+      p.fstype = [vKind UTF8String];
+    }
+
+    NSString *vName = (NSString *)CFDictionaryGetValue(
+        dd, kDADiskDescriptionVolumeNameKey);
+    if (vName != nil) {
+      p.label = [vName UTF8String];
+    }
+
+    CFUUIDRef uuidRef = (CFUUIDRef)CFDictionaryGetValue(
+        dd, kDADiskDescriptionVolumeUUIDKey);
+    if (uuidRef != nil) {
+      CFStringRef uuidStr = CFUUIDCreateString(NULL, uuidRef);
+      if (uuidStr != nil) {
+        p.uuid = [(NSString *)uuidStr UTF8String];
+        CFRelease(uuidStr);
+      }
+    }
+
+    NSString *mediaName = (NSString *)CFDictionaryGetValue(
+        dd, kDADiskDescriptionMediaNameKey);
+    if (mediaName != nil) {
+      p.partlabel = [mediaName UTF8String];
+    }
+
+    // Media content carries the partition type. For GPT it's the
+    // human name when known ("Apple_APFS", "EFI") or the GUID. For
+    // MBR it's the hex byte form ("0x07").
+    NSString *mediaContent = (NSString *)CFDictionaryGetValue(
+        dd, kDADiskDescriptionMediaContentKey);
+    if (mediaContent != nil) {
+      p.parttype = [mediaContent UTF8String];
+    }
+
+    NSNumber *writable = DictionaryGetNumber(
+        dd, kDADiskDescriptionMediaWritableKey);
+    p.isReadOnly = writable != nil ? ![writable boolValue] : false;
+
+    return p;
+  }
+
   std::vector<DeviceDescriptor> ListStorageDevices() {
     std::vector<DeviceDescriptor> deviceList;
 
@@ -114,6 +182,10 @@ namespace Drivelist {
     }
 
     REDiskList *dl = [[REDiskList alloc] init];
+
+    // anyfs fork: pass 1 — index every whole disk so pass 2 can
+    // attach disk{N}s{M} entries to the right parent.
+    std::map<std::string, size_t> wholeDisksByName;
     for (NSString* diskBsdName in dl.disks) {
       if (IsDiskPartition(diskBsdName)) {
         continue;
@@ -132,11 +204,45 @@ namespace Drivelist {
       }
 
       DeviceDescriptor device = CreateDeviceDescriptorFromDiskDescription(diskBsdNameStr, diskDescription);
+      // Mark partitions[] as populated — even an unpartitioned disk
+      // surfaces an empty array (consistent with Linux lsblk).
+      device.partitionsNull = false;
       deviceList.push_back(device);
+      wholeDisksByName[diskBsdNameStr] = deviceList.size() - 1;
 
       CFRelease(diskDescription);
       CFRelease(disk);
     }
+
+    // anyfs fork: pass 2 — attach each disk{N}s{M} as a partition of
+    // its disk{N} parent. APFS sub-volumes (disk{N}s{M}s{K}) belong
+    // to the synthesized APFS container disk that DA reports as a
+    // separate whole disk, so they naturally land there too.
+    for (NSString* diskBsdName in dl.disks) {
+      if (!IsDiskPartition(diskBsdName)) {
+        continue;
+      }
+      std::string partBsdName = [diskBsdName UTF8String];
+      // Parent name = up to the first "s" after the "diskN" prefix.
+      size_t sIdx = partBsdName.find('s', 4);
+      if (sIdx == std::string::npos) continue;
+      std::string parentBsdName = partBsdName.substr(0, sIdx);
+      auto it = wholeDisksByName.find(parentBsdName);
+      if (it == wholeDisksByName.end()) continue;
+
+      DADiskRef disk = DADiskCreateFromBSDName(
+          kCFAllocatorDefault, session, partBsdName.c_str());
+      if (disk == nil) continue;
+      CFDictionaryRef diskDescription = DADiskCopyDescription(disk);
+      if (diskDescription != nil) {
+        Partition p = CreatePartitionFromDiskDescription(
+            partBsdName, diskDescription);
+        deviceList[it->second].partitions.push_back(p);
+        CFRelease(diskDescription);
+      }
+      CFRelease(disk);
+    }
+
     [dl release];
 
     // Add mount points
@@ -171,6 +277,17 @@ namespace Drivelist {
         if (dd->device == "/dev/" + diskBsdName) {
           dd->mountpoints.push_back([[path path] UTF8String]);
           dd->mountpointLabels.push_back([volumeName UTF8String]);
+
+          // anyfs fork: also reflect the mount on the matching
+          // partition so per-partition info is self-contained.
+          std::string partDevice = "/dev/" + partitionBsdName;
+          for (Partition &p : dd->partitions) {
+            if (p.device == partDevice) {
+              p.mountpoints.push_back([[path path] UTF8String]);
+              p.mountpointLabels.push_back([volumeName UTF8String]);
+              break;
+            }
+          }
           break;
         }
       }

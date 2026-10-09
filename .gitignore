@@ -28,3 +28,6 @@ build
 node_modules
 prebuilds
 js
+
+# Cross-compiled native addon and temporary link inputs
+build-win64/

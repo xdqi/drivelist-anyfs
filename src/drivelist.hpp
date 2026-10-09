@@ -27,6 +27,23 @@ struct MountPoint {
   std::string path;
 };
 
+// anyfs fork: per-partition info surfaced by the host OS. FS-aware
+// fields (fstype/label/uuid) end up empty when the OS hasn't probed
+// the filesystem — that's the signal for the UI to ask for raw read.
+struct Partition {
+  std::string device;
+  uint64_t size = 0;        // 0 → null (an unused PartitionEntry has length 0)
+  int32_t number = -1;      // -1 → null (partitions are 1-indexed)
+  std::string fstype;       // empty → null
+  std::string label;        // empty → null
+  std::string uuid;         // empty → null
+  std::string partlabel;    // empty → null
+  std::string parttype;     // empty → null
+  std::vector<std::string> mountpoints;
+  std::vector<std::string> mountpointLabels;
+  bool isReadOnly = false;
+};
+
 struct DeviceDescriptor {
   std::string enumerator;
   std::string busType;
@@ -53,6 +70,11 @@ struct DeviceDescriptor {
   bool isUSB;  // Connected via Universal Serial Bus (USB)
   bool isUAS;  // Connected via the USB Attached SCSI (UAS)
   bool isUASNull;
+  // anyfs fork: populated by platform code that knows how. When
+  // partitionsNull is true the JS layer emits `partitions: null`
+  // (drive's partitions unknown — e.g. an OS we haven't taught yet).
+  std::vector<Partition> partitions;
+  bool partitionsNull = true;
 };
 
 std::vector<DeviceDescriptor> ListStorageDevices();
